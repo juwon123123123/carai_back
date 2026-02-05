@@ -38,6 +38,10 @@ models = {}
 # Firebase Storage 버킷명
 FIREBASE_BUCKET = "knu-team-04.firebasestorage.app"
 
+# [설정] 시각화 색상 (RGB 포맷)
+VIS_PART_COLOR = (0, 255, 255)    # Cyan (부품용)
+VIS_DAMAGE_COLOR = (255, 0, 0)    # Red (손상용)
+
 # 부품 목록 (24개)
 PART_CLASSES = [
     "Front bumper", "Front fender(L)", "Front fender(R)", 
@@ -50,14 +54,6 @@ PART_CLASSES = [
 ]
 
 DAMAGE_CLASSES = ["Scratched", "Separated", "Crushed", "Breakage"]
-
-# 손상 타입별 색상 (BGR)
-DAMAGE_COLORS = {
-    "Scratched": (0, 255, 255),    # 노란색
-    "Separated": (255, 0, 255),    # 마젠타
-    "Crushed": (0, 165, 255),      # 오렌지
-    "Breakage": (0, 0, 255),       # 빨간색
-}
 
 # 차종 리스트 
 KNOWN_MODELS = [
@@ -270,28 +266,54 @@ def save_to_firestore(data):
     except:
         return None
 
-# [새로 추가된 함수] 백그라운드 저장 프로세스
-def background_save_process(visualization_bytes, estimate_data, user_id, timestamp):
+# 백그라운드 저장 프로세스
+def background_save_process(visualization_bytes, part_visualization_bytes, estimate_data, user_id, timestamp):
     try:
         print(f"🔄 [Background] 저장 작업 시작 (User: {user_id})")
-        # 1. 시각화 이미지 업로드
         damage_image_url = upload_to_firebase_storage(visualization_bytes, "damage", f"{user_id}_{timestamp}_damage.jpg")
+        part_image_url = upload_to_firebase_storage(part_visualization_bytes, "damage_part", f"{user_id}_{timestamp}_part.jpg")
         
-        # 2. 견적서 JSON 업로드
         estimate_data["damageImageUrl"] = damage_image_url
+        estimate_data["partImageUrl"] = part_image_url
+        
         estimate_json = json.dumps(estimate_data, ensure_ascii=False, indent=2).encode('utf-8')
         estimate_url = upload_to_firebase_storage(estimate_json, "estimate", f"{user_id}_{timestamp}_estimate.json")
         
-        # 3. Firestore 저장
         save_to_firestore({
             **estimate_data,
             "damageImageUrl": damage_image_url,
+            "partImageUrl": part_image_url,
             "estimateUrl": estimate_url
         })
         print(f"✅ [Background] 모든 저장 완료")
     except Exception as e:
         print(f"❌ [Background] 저장 실패: {e}")
 
+# [수정] 부품 시각화 함수: Cyan 색상만 표시 (Damage 표시 안 함)
+def create_part_visualization(original_image_bytes, part_mask):
+    original_img = Image.open(io.BytesIO(original_image_bytes)).convert("RGB")
+    original_size = original_img.size
+    img_resized = original_img.resize((512, 512))
+    img_np = np.array(img_resized)
+    overlay = img_np.copy()
+    
+    for part_id in np.unique(part_mask):
+        if part_id == 0: continue
+        if part_id > len(PART_CLASSES): continue
+        mask = (part_mask == part_id)
+        # 모든 부품을 VIS_PART_COLOR(Cyan)로 통일
+        overlay[mask] = VIS_PART_COLOR
+        
+    blended = cv2.addWeighted(img_np, 0.6, overlay, 0.4, 0)
+    blended_pil = Image.fromarray(blended.astype(np.uint8))
+    blended_resized = blended_pil.resize(original_size, Image.LANCZOS)
+    
+    buffered = io.BytesIO()
+    blended_resized.save(buffered, format="JPEG", quality=95)
+    return buffered.getvalue()
+
+# [수정] 손상 시각화 함수: Red 색상만 표시 (Part 표시 안 함)
+# damage/ 폴더에 저장될 이미지
 def create_visualization(original_image_bytes, part_mask, damage_masks, detected_parts_info):
     original_img = Image.open(io.BytesIO(original_image_bytes)).convert("RGB")
     original_size = original_img.size
@@ -299,15 +321,17 @@ def create_visualization(original_image_bytes, part_mask, damage_masks, detected
     img_np = np.array(img_resized)
     overlay = img_np.copy()
     
+    # 여기서는 손상 부위만 Red로 칠합니다.
     for info in detected_parts_info:
         try:
             part_id = PART_CLASSES.index(info["part"]) + 1
             part_area = (part_mask == part_id)
             damage_idx = DAMAGE_CLASSES.index(info["damage"])
             damage_area = (damage_masks[damage_idx] == 1)
-            damaged_area = part_area & damage_area
-            color = DAMAGE_COLORS.get(info["damage"], (255, 255, 255))
-            overlay[damaged_area] = color
+            
+            # 부품 영역 내부의 손상만 표시
+            final_damage_area = part_area & damage_area
+            overlay[final_damage_area] = VIS_DAMAGE_COLOR # Red
         except:
             continue
     
@@ -366,7 +390,7 @@ def load_damage_model(path):
 @app.on_event("startup")
 async def startup_event():
     print("="*60)
-    print("🚀 V3 모델 + Firebase (비동기 저장) 서버 시작")
+    print("🚀 V3 모델 + Firebase (Separated Images: Cyan Part / Red Damage) 서버 시작")
     print("="*60)
     try:
         initialize_firebase()
@@ -378,7 +402,7 @@ async def startup_event():
         models['damage_1'] = load_damage_model("models/Unet_damage_label1.pt") 
         models['damage_2'] = load_damage_model("models/Unet_damage_label2.pt") 
         models['damage_3'] = load_damage_model("models/Unet_damage_label3.pt") 
-        models['cost_predictor'] = joblib.load("models/cost_predictor_v3.pkl")
+        models['cost_predictor'] = joblib.load("models/cost_predictor_v4.pkl")
         print("✅ 모든 모델 로드 성공!")
         print("="*60)
     except Exception as e:
@@ -392,11 +416,39 @@ def preprocess_image(image_bytes, target_size=512):
     img_np = img_np.transpose(2, 0, 1)
     return torch.from_numpy(img_np).unsqueeze(0).float().to(device)
 
-def get_cost_prediction(car_model, part_name, damage_type):
+# [수정] 수리 방법 4가지 분류 로직 (Default: Painting)
+def decide_repair_action(damage_type, pixel_count):
+    # 1. 교환 (Replace) - 파손(Breakage)
+    if damage_type == "Breakage":
+        return "Replace", "교환"
+    
+    # 2. 탈착 (Detach) - 이격(Separated)
+    if damage_type == "Separated":
+        return "Detach", "탈착"
+    
+    # 3. 찌그러짐 (Crushed) - 면적에 따라 판금 vs 교환
+    if damage_type == "Crushed":
+        if pixel_count > 5000: # 5000픽셀 이상이면 교환
+            return "Replace", "교환"
+        else:
+            return "Sheet_Metal", "판금"
+            
+    # 4. 그 외 (Scratched 포함, 알 수 없는 유형) -> 기본값: 도장 (Painting)
+    return "Painting", "도장"
+
+def get_cost_prediction(car_model, part_name, damage_type, repair_action_code):
     try:
-        input_df = pd.DataFrame([{'Car_Model': car_model, 'Part': part_name, 'Damage_Type': damage_type}])
+        input_df = pd.DataFrame([{
+            'Car_Model': car_model, 
+            'Part': part_name, 
+            'Damage_Type': damage_type,
+            'Repair_Action': repair_action_code # 영어 코드 (모델용)
+        }])
+        
         pred_value = models['cost_predictor'].predict(input_df)[0]
         cost = int(max(pred_value, 0))
+        
+        # 최소 비용 보정
         min_cost = MINIMUM_COST_BY_PART.get(part_name, 100000)
         multiplier = DAMAGE_MULTIPLIER.get(damage_type, 1.0)
         guaranteed_min = int(min_cost * multiplier)
@@ -404,14 +456,23 @@ def get_cost_prediction(car_model, part_name, damage_type):
             cost = guaranteed_min
         if cost > 5000000:
             cost = 5000000
+            
         return cost, car_model
     except:
-        fallback_df = pd.DataFrame([{'Car_Model': DEFAULT_FALLBACK_CAR, 'Part': part_name, 'Damage_Type': damage_type}])
+        # 예외 발생 시
+        fallback_df = pd.DataFrame([{
+            'Car_Model': DEFAULT_FALLBACK_CAR, 
+            'Part': part_name, 
+            'Damage_Type': damage_type,
+            'Repair_Action': repair_action_code
+        }])
+        
         pred_value = models['cost_predictor'].predict(fallback_df)[0]
         cost = int(max(pred_value, 0))
         min_cost = MINIMUM_COST_BY_PART.get(part_name, 100000)
         multiplier = DAMAGE_MULTIPLIER.get(damage_type, 1.0)
         cost = max(cost, int(min_cost * multiplier))
+        
         return cost, f"{car_model} (대체: {DEFAULT_FALLBACK_CAR})"
 
 @app.post("/predict")
@@ -421,14 +482,11 @@ async def predict(background_tasks: BackgroundTasks, car_model: str = Form(...),
         image_bytes = await file.read()
         input_tensor = preprocess_image(image_bytes)
         
-        # 1. 부품 마스크 추출
         with torch.no_grad():
             part_out = models['part'](input_tensor)
             part_mask = torch.argmax(part_out, dim=1).cpu().numpy()[0]
 
-        # 2. 4개의 손상 모델 병렬 실행
         damage_masks = {}
-        
         def run_damage_inference(i):
             with torch.no_grad():
                 d_out = models[f'damage_{i}'](input_tensor)
@@ -462,14 +520,27 @@ async def predict(background_tasks: BackgroundTasks, car_model: str = Form(...),
                         detected_damage_type = d_name
 
             if found_damage:
-                cost, used_model = get_cost_prediction(matched_car_model, part_name, detected_damage_type)
+                # [수정] 수리 방법 결정 (영어 코드, 한글 명칭 반환)
+                repair_code, repair_name = decide_repair_action(detected_damage_type, max_damage_pixels)
+                
+                cost, used_model = get_cost_prediction(matched_car_model, part_name, detected_damage_type, repair_code)
+                
                 if DEFAULT_FALLBACK_CAR in used_model:
                     final_car_model_used = used_model
                 total_estimated_cost += cost
-                detected_parts_info.append({"part": part_name, "damage": detected_damage_type, "cost": cost})
+                
+                # [수정] 프론트엔드에 보낼 정보에 'repair_method' 추가 (한글)
+                detected_parts_info.append({
+                    "part": part_name, 
+                    "damage": detected_damage_type, 
+                    "repair_method": repair_name, # 예: "도장", "판금", "교환"
+                    "cost": cost
+                })
 
-        # 3. 시각화 및 데이터 준비 (여기서 미리 생성해서 백그라운드로 넘김)
-        visualization_bytes = create_visualization(image_bytes, part_mask, damage_masks, detected_parts_info)
+        # [수정] 각각의 이미지를 생성 (섞지 않음)
+        visualization_bytes = create_visualization(image_bytes, part_mask, damage_masks, detected_parts_info) # Red Damage Only
+        part_visualization_bytes = create_part_visualization(image_bytes, part_mask) # Cyan Part Only
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         estimate_data = {
@@ -482,11 +553,9 @@ async def predict(background_tasks: BackgroundTasks, car_model: str = Form(...),
             "analysisDate": datetime.now().isoformat()
         }
 
-        # 4. 백그라운드 태스크 등록 (응답 후 실행됨)
-        background_tasks.add_task(background_save_process, visualization_bytes, estimate_data, user_id, timestamp)
+        background_tasks.add_task(background_save_process, visualization_bytes, part_visualization_bytes, estimate_data, user_id, timestamp)
 
-        # 5. 사용자에게 즉시 응답 (URL은 백그라운드 처리 중이므로 포함되지 않음)
-        print(f"💰 [응답 반환] 총 {total_estimated_cost:,}원 (저장은 백그라운드 처리)")
+        print(f"💰 [응답 반환] 총 {total_estimated_cost:,}원 (이미지 저장은 백그라운드 처리)")
         return {
             "status": "success", 
             "message": "Analysis complete. Data saving in background.",
@@ -502,4 +571,4 @@ async def predict(background_tasks: BackgroundTasks, car_model: str = Form(...),
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "version": "v3-firebase-async", "models_loaded": len(models), "firebase_bucket": FIREBASE_BUCKET}
+    return {"status": "healthy", "version": "v3-sep-colors", "models_loaded": len(models), "firebase_bucket": FIREBASE_BUCKET}
