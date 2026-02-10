@@ -603,6 +603,10 @@ async def predict(background_tasks: BackgroundTasks, car_model: str = Form(...),
         print(f"❌ {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/car-models")
+async def get_car_models():
+    return {"models": KNOWN_MODELS}
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "version": "v3-3images-orange", "models_loaded": len(models), "firebase_bucket": FIREBASE_BUCKET}
